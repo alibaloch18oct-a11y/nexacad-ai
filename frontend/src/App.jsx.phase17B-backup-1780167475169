@@ -1,0 +1,2233 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import axios from "axios";
+import { v4 as uuidv4 } from "uuid";
+import {
+  Building2,
+  RefreshCw,
+  Wifi,
+  WifiOff,
+  Ruler,
+  Home,
+  Layers,
+  Boxes,
+  Box,
+  DraftingCompass,
+  FileSpreadsheet,
+  RotateCcw,
+  AlertTriangle,
+  Sparkles,
+  Maximize2,
+  Minimize2,
+  Wand2,
+  LayoutDashboard
+} from "lucide-react";
+
+import CADToolbar from "./components/CADToolbar.jsx";
+import CADCanvas from "./components/CADCanvas.jsx";
+import InspectorPanel from "./components/InspectorPanel.jsx";
+import AICommandPanel from "./components/AICommandPanel.jsx";
+import ProjectPanel from "./components/ProjectPanel.jsx";
+import EstimatePanel from "./components/EstimatePanel.jsx";
+import ThreeDPreview from "./components/ThreeDPreview.jsx";
+import ExteriorElevation from "./components/ExteriorElevation.jsx";
+import ProjectSettingsPanel from "./components/ProjectSettingsPanel.jsx";
+import RoomSchedulePanel from "./components/RoomSchedulePanel.jsx";
+import ProjectBackupPanel from "./components/ProjectBackupPanel.jsx";
+import {
+  exportBOQCSV,
+  exportPlanDXF,
+  exportPlanPDF,
+  exportStagePNG
+} from "./utils/exportUtils.js";
+
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5100";
+const AUTOSAVE_KEY = "nexacad_ai_pro_autosave_v1";
+
+const SAMPLE_PROMPT =
+  "Create a 30x60 double-story modern house with 4 bedrooms, car porch, drawing room, open kitchen, attached baths, stairs, terrace, laundry, store and front elevation.";
+
+const STARTER_TEMPLATES = [
+  {
+    id: "30x60",
+    title: "30 x 60 Double Story",
+    subtitle: "4 bedrooms, car porch, drawing room, kitchen, stairs",
+    width: 30,
+    length: 60,
+    floors: 2
+  },
+  {
+    id: "25x50",
+    title: "25 x 50 Compact House",
+    subtitle: "3 bedrooms, open kitchen, lounge, terrace",
+    width: 25,
+    length: 50,
+    floors: 2
+  },
+  {
+    id: "40x80",
+    title: "40 x 80 Luxury Villa",
+    subtitle: "5 bedrooms, large lounge, porch, terrace, façade",
+    width: 40,
+    length: 80,
+    floors: 2
+  }
+];
+
+const QUICK_TEMPLATES = [
+  {
+    id: "t1",
+    title: "30x60 Double Story",
+    subtitle: "4 beds + car porch",
+    prompt:
+      "Create a 30x60 double-story house with 4 bedrooms, car porch, drawing room, TV lounge, kitchen, attached baths, stairs, balcony and terrace with modern elevation."
+  },
+  {
+    id: "t2",
+    title: "25x50 Compact House",
+    subtitle: "3 beds + open kitchen",
+    prompt:
+      "Create a 25x50 modern compact house with 3 bedrooms, drawing room, open kitchen, attached baths, stairs, laundry and terrace."
+  },
+  {
+    id: "t3",
+    title: "40x80 Luxury Villa",
+    subtitle: "5 beds + servant room",
+    prompt:
+      "Create a 40x80 luxury double-story villa with 5 bedrooms, car porch, drawing room, lounge, kitchen, servant room, attached baths, staircase, terrace and modern front elevation."
+  },
+  {
+    id: "t4",
+    title: "Commercial Plaza",
+    subtitle: "shops + offices",
+    prompt:
+      "Create a 30x70 commercial plaza plan with ground floor shops, first floor offices, staircase, washrooms, lobby and modern elevation."
+  }
+];
+
+function clone(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function getDefaultEstimate() {
+  return {
+    totalBuiltArea: 0,
+    totalWallLength: 0,
+    doorsCount: 0,
+    windowsCount: 0,
+    materials: {
+      bricks: 0,
+      cementBags: 0,
+      sandCft: 0,
+      steelKg: 0,
+      tileSqft: 0,
+      paintSqft: 0
+    },
+    cost: {
+      low: 0,
+      medium: 0,
+      high: 0
+    },
+    note: "Estimate will appear after generating a valid plan."
+  };
+}
+
+function ensureLayers(plan) {
+  const current = Array.isArray(plan.layers) ? plan.layers : [];
+
+  const required = [
+    { id: "architecture", name: "Architecture", visible: true, locked: false },
+    { id: "walls", name: "Walls", visible: true, locked: false },
+    { id: "openings", name: "Doors & Windows", visible: true, locked: false },
+    { id: "stairs", name: "Stairs", visible: true, locked: false },
+    { id: "dimensions", name: "Dimensions", visible: true, locked: false },
+    { id: "text", name: "Text Labels", visible: true, locked: false },
+    { id: "facade", name: "Façade Concept", visible: true, locked: false },
+    { id: "curves", name: "Curved Walls / Gallery", visible: true, locked: false }
+  ];
+
+  const merged = [...current];
+
+  required.forEach((layer) => {
+    if (!merged.some((item) => item.id === layer.id)) {
+      merged.push(layer);
+    }
+  });
+
+  return merged;
+}
+
+function getDefaultProjectInfo(plan) {
+  return {
+    clientName: plan?.projectInfo?.clientName || "",
+    clientPhone: plan?.projectInfo?.clientPhone || "",
+    projectLocation: plan?.projectInfo?.projectLocation || "",
+    preparedBy: plan?.projectInfo?.preparedBy || "NexaCAD AI Pro",
+    drawingStatus: plan?.projectInfo?.drawingStatus || "Concept Drawing",
+    projectNotes: plan?.projectInfo?.projectNotes || ""
+  };
+}
+
+function normalizePlan(plan) {
+  if (!plan) return null;
+
+  return {
+    ...plan,
+    id: plan.id || uuidv4(),
+    title: plan.title || "NexaCAD Project",
+    prompt: plan.prompt || "",
+    plot: plan.plot || { width: 30, length: 60 },
+    floors: plan.floors || 1,
+    scale: plan.scale || 12,
+    canvas: plan.canvas || {
+      width: Math.max(720, (plan.plot?.width || 30) * 12),
+      height: Math.max(540, (plan.plot?.length || 60) * 12)
+    },
+    rooms: Array.isArray(plan.rooms) ? plan.rooms : [],
+    doors: Array.isArray(plan.doors) ? plan.doors : [],
+    windows: Array.isArray(plan.windows) ? plan.windows : [],
+    stairs: Array.isArray(plan.stairs) ? plan.stairs : [],
+    walls: Array.isArray(plan.walls) ? plan.walls : [],
+    furniture: Array.isArray(plan.furniture) ? plan.furniture : [],
+    dimensions: Array.isArray(plan.dimensions)
+      ? plan.dimensions.map((dimension) => ({
+          id: dimension.id || uuidv4(),
+          floor: dimension.floor || 0,
+          x: dimension.x ?? dimension.x1 ?? 20,
+          y: dimension.y ?? dimension.y1 ?? 20,
+          width:
+            dimension.width ??
+            Math.abs((dimension.x2 || 180) - (dimension.x1 || 20)),
+          height: dimension.height ?? 0,
+          label: dimension.label || "Dimension",
+          layer: "dimensions"
+        }))
+      : [],
+    texts: Array.isArray(plan.texts) ? plan.texts : [],
+    facade: plan.facade || {
+      enabled: true,
+      style: "modern",
+      color: "#dbeafe",
+      accent: "#38bdf8"
+    },
+    estimate: plan.estimate || getDefaultEstimate(),
+    projectInfo: getDefaultProjectInfo(plan),
+    layers: ensureLayers(plan),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function calculateDistanceFeet(width, height, scale) {
+  const distance = Math.sqrt(width * width + height * height);
+  return Math.max(1, Math.round(distance / scale));
+}
+
+function distancePointToSegment(point, wall) {
+  const x1 = wall.x;
+  const y1 = wall.y;
+  const x2 = wall.x + wall.width;
+  const y2 = wall.y + wall.height;
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+
+  if (dx === 0 && dy === 0) {
+    return {
+      distance: Math.hypot(point.x - x1, point.y - y1),
+      x: x1,
+      y: y1,
+      angle: 0
+    };
+  }
+
+  const t = Math.max(
+    0,
+    Math.min(1, ((point.x - x1) * dx + (point.y - y1) * dy) / (dx * dx + dy * dy))
+  );
+
+  const x = x1 + t * dx;
+  const y = y1 + t * dy;
+
+  return {
+    distance: Math.hypot(point.x - x, point.y - y),
+    x,
+    y,
+    angle: Math.atan2(dy, dx)
+  };
+}
+
+function findNearestWall(plan, point, activeFloor) {
+  const walls = (plan.walls || []).filter((wall) => wall.floor === activeFloor);
+  if (walls.length === 0) return null;
+
+  let best = null;
+
+  walls.forEach((wall) => {
+    const result = distancePointToSegment(point, wall);
+    if (!best || result.distance < best.distance) {
+      best = { wall, ...result };
+    }
+  });
+
+  if (!best || best.distance > 40) return null;
+  return best;
+}
+
+function makeSnappedOpeningGeometry(kind, nearest, fallbackPoint) {
+  if (!nearest) {
+    if (kind === "door") {
+      return { x: fallbackPoint.x, y: fallbackPoint.y, width: 36, height: 8 };
+    }
+    return { x: fallbackPoint.x, y: fallbackPoint.y, width: 8, height: 40 };
+  }
+
+  const horizontal =
+    Math.abs(Math.cos(nearest.angle)) >= Math.abs(Math.sin(nearest.angle));
+
+  if (kind === "door") {
+    return horizontal
+      ? { x: nearest.x - 18, y: nearest.y - 4, width: 36, height: 8 }
+      : { x: nearest.x - 4, y: nearest.y - 18, width: 8, height: 36 };
+  }
+
+  return horizontal
+    ? { x: nearest.x - 22, y: nearest.y - 4, width: 44, height: 8 }
+    : { x: nearest.x - 4, y: nearest.y - 22, width: 8, height: 44 };
+}
+
+function roomsOverlap(a, b) {
+  return !(
+    a.x + a.width <= b.x ||
+    b.x + b.width <= a.x ||
+    a.y + a.height <= b.y ||
+    b.y + b.height <= a.y
+  );
+}
+
+function detectCollisionWarnings(plan) {
+  if (!plan) return [];
+
+  const warnings = [];
+  const rooms = Array.isArray(plan.rooms) ? plan.rooms : [];
+
+  for (let i = 0; i < rooms.length; i += 1) {
+    for (let j = i + 1; j < rooms.length; j += 1) {
+      const a = rooms[i];
+      const b = rooms[j];
+
+      if (a.floor !== b.floor) continue;
+      if (["terrace"].includes(a.type) || ["terrace"].includes(b.type)) continue;
+
+      if (roomsOverlap(a, b)) {
+        warnings.push({
+          id: `${a.id}-${b.id}`,
+          floor: a.floor,
+          floorLabel: a.floor === 0 ? "Ground Floor" : `Floor ${a.floor}`,
+          roomA: a.name,
+          roomB: b.name
+        });
+      }
+    }
+  }
+
+  return warnings;
+}
+
+function resolveSelectedLabel(plan, selected) {
+  if (!plan || !selected) return "Nothing selected";
+
+  const map = {
+    room: plan.rooms,
+    door: plan.doors,
+    window: plan.windows,
+    stairs: plan.stairs,
+    wall: plan.walls,
+    dimension: plan.dimensions,
+    text: plan.texts
+  };
+
+  const list = map[selected.type] || [];
+  const item = list.find((entry) => entry.id === selected.id);
+
+  if (!item) return "Nothing selected";
+  if (selected.type === "room") return `Room • ${item.name}`;
+  if (selected.type === "wall") return "Wall selected";
+  if (selected.type === "stairs") return item.name || "Stairs selected";
+  if (selected.type === "text") return `Text • ${item.text}`;
+
+  return `${selected.type.charAt(0).toUpperCase()}${selected.type.slice(1)} selected`;
+}
+
+function colorByType(type) {
+  const map = {
+    bedroom: "#fae8ff",
+    bathroom: "#ccfbf1",
+    kitchen: "#dcfce7",
+    drawing: "#e0e7ff",
+    living: "#fef3c7",
+    lounge: "#fef3c7",
+    parking: "#dbeafe",
+    terrace: "#bfdbfe",
+    stairs: "#fee2e2",
+    store: "#f3f4f6",
+    laundry: "#e0f2fe"
+  };
+
+  return map[type] || "#e0e7ff";
+}
+
+function createRoom({ name, type, floor, x, y, w, h, scale }) {
+  return {
+    id: uuidv4(),
+    name,
+    type,
+    floor,
+    x: x * scale,
+    y: y * scale,
+    width: w * scale,
+    height: h * scale,
+    color: colorByType(type),
+    wallThickness: 6,
+    layer: "architecture",
+    locked: false
+  };
+}
+
+function createStarterPlan(template) {
+  const scale = 12;
+  const canvas = {
+    width: Math.max(720, template.width * scale),
+    height: Math.max(640, template.length * scale)
+  };
+
+  const baseRooms =
+    template.id === "40x80"
+      ? [
+          ["Car Porch", "parking", 0, 1, 1, 16, 18],
+          ["Drawing Room", "drawing", 0, 18, 1, 14, 14],
+          ["Living Lounge", "living", 0, 18, 16, 18, 16],
+          ["Kitchen", "kitchen", 0, 1, 21, 14, 12],
+          ["Guest Bedroom", "bedroom", 0, 1, 35, 14, 14],
+          ["Bath", "bathroom", 0, 16, 35, 7, 8],
+          ["Stairs", "stairs", 0, 26, 35, 10, 14],
+          ["Master Bedroom", "bedroom", 1, 1, 1, 16, 15],
+          ["Bedroom 2", "bedroom", 1, 18, 1, 14, 14],
+          ["Bedroom 3", "bedroom", 1, 1, 18, 14, 14],
+          ["Family Lounge", "living", 1, 16, 18, 18, 14],
+          ["Terrace", "terrace", 1, 1, 35, 22, 12]
+        ]
+      : template.id === "25x50"
+      ? [
+          ["Car Porch", "parking", 0, 1, 1, 12, 14],
+          ["Drawing Room", "drawing", 0, 14, 1, 10, 12],
+          ["Kitchen", "kitchen", 0, 1, 17, 10, 10],
+          ["Living Lounge", "living", 0, 12, 15, 12, 12],
+          ["Bath", "bathroom", 0, 1, 29, 7, 8],
+          ["Stairs", "stairs", 0, 10, 29, 10, 13],
+          ["Master Bedroom", "bedroom", 1, 1, 1, 12, 13],
+          ["Bedroom 2", "bedroom", 1, 14, 1, 10, 12],
+          ["Bedroom 3", "bedroom", 1, 1, 16, 12, 12],
+          ["Terrace", "terrace", 1, 1, 31, 20, 10]
+        ]
+      : [
+          ["Car Porch", "parking", 0, 1, 1, 14, 16],
+          ["Drawing Room", "drawing", 0, 16, 1, 13, 13],
+          ["Kitchen", "kitchen", 0, 1, 19, 11, 11],
+          ["Living Lounge", "living", 0, 13, 17, 16, 14],
+          ["Bedroom 1", "bedroom", 0, 1, 33, 12, 13],
+          ["Bath", "bathroom", 0, 14, 33, 7, 8],
+          ["Stairs", "stairs", 0, 21, 33, 8, 13],
+          ["Master Bedroom", "bedroom", 1, 1, 1, 13, 14],
+          ["Bedroom 2", "bedroom", 1, 16, 1, 12, 13],
+          ["Bedroom 3", "bedroom", 1, 1, 17, 12, 13],
+          ["Family Lounge", "living", 1, 15, 17, 14, 13],
+          ["Terrace", "terrace", 1, 1, 35, 26, 11]
+        ];
+
+  const rooms = baseRooms.map(([name, type, floor, x, y, w, h]) =>
+    createRoom({ name, type, floor, x, y, w, h, scale })
+  );
+
+  const doors = [];
+  const windows = [];
+  const stairs = [];
+
+  rooms.forEach((room) => {
+    if (room.type === "stairs") {
+      stairs.push({
+        id: uuidv4(),
+        floor: room.floor,
+        x: room.x,
+        y: room.y,
+        width: room.width,
+        height: room.height,
+        type: "straight-stair",
+        name: "Stairs",
+        layer: "stairs"
+      });
+      return;
+    }
+
+    if (!["terrace", "parking"].includes(room.type)) {
+      doors.push({
+        id: uuidv4(),
+        roomId: room.id,
+        floor: room.floor,
+        x: room.x + room.width / 2 - 18,
+        y: room.y + room.height - 8,
+        width: 36,
+        height: 8,
+        type: "door",
+        label: "Door",
+        layer: "openings"
+      });
+    }
+
+    if (!["bathroom", "store", "laundry"].includes(room.type)) {
+      windows.push({
+        id: uuidv4(),
+        roomId: room.id,
+        floor: room.floor,
+        x: room.x + room.width - 8,
+        y: room.y + room.height / 2 - 22,
+        width: 8,
+        height: 44,
+        type: "window",
+        label: "Window",
+        layer: "openings"
+      });
+    }
+  });
+
+  const cleanRooms = rooms.filter((room) => room.type !== "stairs");
+
+  return normalizePlan({
+    id: uuidv4(),
+    title: `${template.title} Concept`,
+    prompt: `Starter generated: ${template.title}`,
+    plot: {
+      width: template.width,
+      length: template.length
+    },
+    floors: template.floors,
+    scale,
+    canvas,
+    rooms: cleanRooms,
+    doors,
+    windows,
+    stairs,
+    walls: [
+      {
+        id: uuidv4(),
+        floor: 0,
+        x: 0,
+        y: 0,
+        width: template.width * scale,
+        height: 0,
+        thickness: 10,
+        type: "wall",
+        layer: "walls"
+      },
+      {
+        id: uuidv4(),
+        floor: 0,
+        x: template.width * scale,
+        y: 0,
+        width: 0,
+        height: template.length * scale,
+        thickness: 10,
+        type: "wall",
+        layer: "walls"
+      },
+      {
+        id: uuidv4(),
+        floor: 0,
+        x: 0,
+        y: template.length * scale,
+        width: template.width * scale,
+        height: 0,
+        thickness: 10,
+        type: "wall",
+        layer: "walls"
+      },
+      {
+        id: uuidv4(),
+        floor: 0,
+        x: 0,
+        y: 0,
+        width: 0,
+        height: template.length * scale,
+        thickness: 10,
+        type: "wall",
+        layer: "walls"
+      }
+    ],
+    dimensions: [
+      {
+        id: uuidv4(),
+        floor: 0,
+        x: 0,
+        y: -28,
+        width: template.width * scale,
+        height: 0,
+        label: `${template.width} ft`,
+        layer: "dimensions"
+      },
+      {
+        id: uuidv4(),
+        floor: 0,
+        x: -34,
+        y: 0,
+        width: 0,
+        height: template.length * scale,
+        label: `${template.length} ft`,
+        layer: "dimensions"
+      }
+    ],
+    texts: [
+      {
+        id: uuidv4(),
+        floor: 0,
+        x: 16,
+        y: template.length * scale - 35,
+        text: "Modern Front Elevation Concept",
+        fontSize: 16,
+        fontStyle: "bold",
+        color: "#0f172a",
+        layer: "text"
+      }
+    ],
+    facade: {
+      enabled: true,
+      style: template.id === "40x80" ? "luxury-modern" : "modern",
+      color: "#dbeafe",
+      accent: "#38bdf8"
+    },
+    estimate: getDefaultEstimate(),
+    projectInfo: {
+      clientName: "",
+      clientPhone: "",
+      projectLocation: "",
+      preparedBy: "NexaCAD AI Pro",
+      drawingStatus: "Concept Drawing",
+      projectNotes: "Starter concept generated by NexaCAD AI Pro."
+    }
+  });
+}
+
+
+function applyNexaCADDesignCommand(plan, command, activeFloor) {
+  if (!plan || !command) return null;
+
+  const text = String(command || "").toLowerCase();
+  const next = clone(plan);
+
+  next.curvedWalls = Array.isArray(next.curvedWalls) ? next.curvedWalls : [];
+  next.facade = next.facade || {
+    enabled: true,
+    style: "modern",
+    color: "#dbeafe",
+    accent: "#38bdf8",
+    glassBalcony: true,
+    blackFrame: true,
+    porchColumns: true,
+    garden: true,
+    driveway: true
+  };
+
+  const scale = next.scale || 12;
+  const plotWidth = next.plot?.width || 30;
+  const plotLength = next.plot?.length || 60;
+
+  let changed = false;
+  let preferredView = "2d";
+
+  function addCurve(type, name, options = {}) {
+    next.curvedWalls.push({
+      id: uuidv4(),
+      floor: activeFloor || 0,
+      x: options.x ?? Math.round((plotWidth * scale) / 2),
+      y: options.y ?? Math.round((plotLength * scale) * 0.18),
+      radius: options.radius ?? 84,
+      startAngle: options.startAngle ?? 200,
+      endAngle: options.endAngle ?? 340,
+      thickness: options.thickness ?? 8,
+      height: options.height ?? 2.1,
+      type,
+      name,
+      layer: "curves"
+    });
+
+    changed = true;
+  }
+
+  if (
+    text.includes("curved gallery") ||
+    text.includes("curve gallery") ||
+    text.includes("round gallery")
+  ) {
+    addCurve("curved-gallery", "Curved Front Gallery", {
+      y: Math.round((plotLength * scale) * 0.12),
+      radius: 96,
+      startAngle: 200,
+      endAngle: 340,
+      height: 1.4
+    });
+    preferredView = "2d";
+  }
+
+  if (
+    text.includes("curved wall") ||
+    text.includes("curve wall") ||
+    text.includes("round wall") ||
+    text.includes("arc wall")
+  ) {
+    addCurve("curved-wall", "Curved Wall", {
+      y: Math.round((plotLength * scale) * 0.35),
+      radius: 72,
+      startAngle: 210,
+      endAngle: 330,
+      height: 2.2
+    });
+    preferredView = "2d";
+  }
+
+  if (
+    text.includes("curved boundary") ||
+    text.includes("round boundary") ||
+    text.includes("boundary curve")
+  ) {
+    addCurve("curved-boundary", "Curved Boundary Wall", {
+      y: Math.round((plotLength * scale) * 0.08),
+      radius: Math.max(110, Math.round(plotWidth * scale * 0.34)),
+      startAngle: 190,
+      endAngle: 350,
+      height: 1.55,
+      thickness: 10
+    });
+    preferredView = "2d";
+  }
+
+  if (
+    text.includes("curved balcony") ||
+    text.includes("round balcony") ||
+    text.includes("curve balcony")
+  ) {
+    addCurve("curved-balcony", "Curved Glass Balcony", {
+      floor: Math.min(1, next.floors - 1),
+      y: Math.round((plotLength * scale) * 0.1),
+      radius: 78,
+      startAngle: 205,
+      endAngle: 335,
+      height: 1.1,
+      thickness: 6
+    });
+
+    next.facade.glassBalcony = true;
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (
+    text.includes("modern") ||
+    text.includes("grey") ||
+    text.includes("gray") ||
+    text.includes("white") ||
+    text.includes("black frame")
+  ) {
+    next.facade.style = "modern-white-grey";
+    next.facade.color = "#f8fafc";
+    next.facade.accent = "#343a40";
+    next.facade.blackFrame = true;
+    next.facade.glassBalcony = true;
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (
+    text.includes("luxury") ||
+    text.includes("villa") ||
+    text.includes("premium")
+  ) {
+    next.facade.style = "luxury-villa";
+    next.facade.color = "#f8fafc";
+    next.facade.accent = "#111827";
+    next.facade.blackFrame = true;
+    next.facade.glassBalcony = true;
+    next.facade.porchColumns = true;
+    next.facade.garden = true;
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (
+    text.includes("commercial") ||
+    text.includes("plaza") ||
+    text.includes("shops") ||
+    text.includes("office elevation")
+  ) {
+    next.facade.style = "commercial-plaza";
+    next.facade.color = "#e5e7eb";
+    next.facade.accent = "#0f172a";
+    next.facade.blackFrame = true;
+    next.facade.glassBalcony = false;
+    next.facade.porchColumns = false;
+    next.facade.signage = true;
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (
+    text.includes("classic") ||
+    text.includes("traditional")
+  ) {
+    next.facade.style = "classic-house";
+    next.facade.color = "#fef3c7";
+    next.facade.accent = "#92400e";
+    next.facade.blackFrame = false;
+    next.facade.glassBalcony = false;
+    next.facade.porchColumns = true;
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (text.includes("glass balcony") || text.includes("glass railing")) {
+    next.facade.glassBalcony = true;
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (text.includes("black frame") || text.includes("dark frame")) {
+    next.facade.blackFrame = true;
+    next.facade.accent = "#111827";
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (text.includes("porch column") || text.includes("front column") || text.includes("columns")) {
+    next.facade.porchColumns = true;
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (text.includes("garden") || text.includes("lawn") || text.includes("landscape")) {
+    next.facade.garden = true;
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (text.includes("driveway") || text.includes("car way") || text.includes("parking ramp")) {
+    next.facade.driveway = true;
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (
+    text.includes("outside view") ||
+    text.includes("exterior") ||
+    text.includes("elevation") ||
+    text.includes("front view") ||
+    text.includes("front elevation")
+  ) {
+    next.facade.enabled = true;
+    changed = true;
+    preferredView = "elevation";
+  }
+
+  if (!changed) return null;
+
+  next.updatedAt = new Date().toISOString();
+
+  return {
+    plan: next,
+    viewMode: preferredView
+  };
+}
+
+
+
+function makeFurnitureForRoom(room, plan) {
+  const scale = plan?.scale || 12;
+  const base = {
+    floor: room.floor || 0,
+    roomId: room.id,
+    layer: "furniture",
+    rotation: 0
+  };
+
+  const items = [];
+
+  function add(type, name, x, y, width, height, color) {
+    items.push({
+      ...base,
+      id: uuidv4(),
+      type,
+      name,
+      x,
+      y,
+      width,
+      height,
+      color
+    });
+  }
+
+  const x = room.x;
+  const y = room.y;
+  const w = room.width;
+  const h = room.height;
+
+  if (room.type === "bedroom") {
+    add("bed", "Bed", x + w * 0.12, y + h * 0.16, Math.min(5 * scale, w * 0.42), Math.min(6.5 * scale, h * 0.48), "#c4b5fd");
+    add("wardrobe", "Wardrobe", x + w * 0.62, y + h * 0.12, Math.min(3 * scale, w * 0.25), Math.min(1.3 * scale, h * 0.16), "#a78bfa");
+    add("side-table", "Side Table", x + w * 0.12, y + h * 0.68, Math.min(1.5 * scale, w * 0.16), Math.min(1.5 * scale, h * 0.16), "#ddd6fe");
+  }
+
+  if (room.type === "living" || room.type === "lounge" || room.name?.toLowerCase().includes("lounge")) {
+    add("sofa", "Sofa", x + w * 0.12, y + h * 0.18, Math.min(6 * scale, w * 0.45), Math.min(2.3 * scale, h * 0.22), "#fde68a");
+    add("tv-unit", "TV Unit", x + w * 0.62, y + h * 0.2, Math.min(4.5 * scale, w * 0.32), Math.min(1 * scale, h * 0.12), "#f59e0b");
+    add("coffee-table", "Coffee Table", x + w * 0.32, y + h * 0.52, Math.min(3 * scale, w * 0.28), Math.min(1.8 * scale, h * 0.18), "#fef3c7");
+  }
+
+  if (room.type === "drawing") {
+    add("sofa-set", "Sofa Set", x + w * 0.14, y + h * 0.2, Math.min(6 * scale, w * 0.5), Math.min(2.2 * scale, h * 0.24), "#bae6fd");
+    add("center-table", "Center Table", x + w * 0.34, y + h * 0.55, Math.min(3 * scale, w * 0.3), Math.min(1.8 * scale, h * 0.2), "#e0f2fe");
+  }
+
+  if (room.type === "kitchen") {
+    add("kitchen-counter", "Kitchen Counter", x + w * 0.1, y + h * 0.1, Math.min(7 * scale, w * 0.72), Math.min(1.3 * scale, h * 0.18), "#94a3b8");
+    add("sink", "Sink", x + w * 0.16, y + h * 0.12, Math.min(2 * scale, w * 0.22), Math.min(1 * scale, h * 0.12), "#67e8f9");
+  }
+
+  if (room.type === "bathroom") {
+    add("toilet", "Toilet", x + w * 0.14, y + h * 0.16, Math.min(1.8 * scale, w * 0.28), Math.min(2.2 * scale, h * 0.3), "#f8fafc");
+    add("basin", "Basin", x + w * 0.58, y + h * 0.16, Math.min(1.8 * scale, w * 0.28), Math.min(1.4 * scale, h * 0.22), "#e0f2fe");
+    add("shower", "Shower", x + w * 0.55, y + h * 0.58, Math.min(2.2 * scale, w * 0.32), Math.min(2.2 * scale, h * 0.32), "#cffafe");
+  }
+
+  if (room.type === "parking") {
+    add("car", "Car", x + w * 0.18, y + h * 0.18, Math.min(6.5 * scale, w * 0.62), Math.min(12 * scale, h * 0.7), "#bfdbfe");
+  }
+
+  return items;
+}
+
+function generateFurnitureLayout(plan) {
+  const next = clone(plan);
+  next.furniture = [];
+
+  (next.rooms || []).forEach((room) => {
+    next.furniture.push(...makeFurnitureForRoom(room, next));
+  });
+
+  next.updatedAt = new Date().toISOString();
+  return next;
+}
+
+function applyPhase17Command(plan, command) {
+  if (!plan || !command) return null;
+
+  const text = String(command).toLowerCase();
+
+  const furnitureWords = [
+    "add furniture",
+    "furniture layout",
+    "furnish",
+    "add bed",
+    "add sofa",
+    "add car",
+    "add wardrobe",
+    "add kitchen counter"
+  ];
+
+  if (furnitureWords.some((word) => text.includes(word))) {
+    return {
+      plan: generateFurnitureLayout(plan),
+      viewMode: "2d",
+      planMode: "furniture"
+    };
+  }
+
+  return null;
+}
+
+
+export default function App() {
+  const [backendStatus, setBackendStatus] = useState("checking");
+  const [prompt, setPrompt] = useState(SAMPLE_PROMPT);
+  const [aiCommand, setAiCommand] = useState("");
+  const [plan, setPlan] = useState(null);
+  const [projects, setProjects] = useState([]);
+  const [activeFloor, setActiveFloor] = useState(0);
+  const [selected, setSelected] = useState(null);
+  const [activeTool, setActiveTool] = useState("select");
+  const [viewMode, setViewMode] = useState("dashboard");
+  const [planMode, setPlanMode] = useState("architectural");
+  const [zoom, setZoom] = useState(1);
+  const [stagePosition, setStagePosition] = useState({ x: 0, y: 0 });
+  const [history, setHistory] = useState([]);
+  const [future, setFuture] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [commandLoading, setCommandLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [autosaveStatus, setAutosaveStatus] = useState("No autosave loaded");
+  const [fullscreenStudio, setFullscreenStudio] = useState(false);
+
+  const stageRef = useRef(null);
+
+  useEffect(() => {
+    checkBackend();
+    loadProjects();
+    restoreAutosave();
+  }, []);
+
+  useEffect(() => {
+    if (!plan) return;
+
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem(
+          AUTOSAVE_KEY,
+          JSON.stringify({
+            plan: normalizePlan(plan),
+            activeFloor,
+            viewMode,
+            savedAt: new Date().toISOString()
+          })
+        );
+
+        setAutosaveStatus(`Autosaved ${new Date().toLocaleTimeString()}`);
+      } catch {
+        setAutosaveStatus("Autosave failed");
+      }
+    }, 700);
+
+    return () => clearTimeout(timer);
+  }, [plan, activeFloor, viewMode]);
+
+  useEffect(() => {
+    function onKeyDown(event) {
+      if (event.key === "Delete" || event.key === "Backspace") {
+        const tag = document.activeElement?.tagName?.toLowerCase();
+        if (tag === "input" || tag === "textarea" || tag === "select") return;
+        deleteSelected();
+      }
+
+      if (event.ctrlKey && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        undo();
+      }
+
+      if (event.ctrlKey && event.key.toLowerCase() === "y") {
+        event.preventDefault();
+        redo();
+      }
+
+      if (event.key === "Escape") {
+        setActiveTool("select");
+        setSelected(null);
+        setFullscreenStudio(false);
+      }
+
+      if (event.key === "F11") {
+        event.preventDefault();
+        setFullscreenStudio((value) => !value);
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
+  const collisionWarnings = useMemo(() => detectCollisionWarnings(plan), [plan]);
+
+  const stats = useMemo(() => {
+    if (!plan) {
+      return {
+        plot: "-",
+        floors: "-",
+        rooms: "-",
+        layers: "-",
+        floorArea: 0
+      };
+    }
+
+    const currentFloorRooms = plan.rooms.filter((room) => room.floor === activeFloor);
+    const currentFloorArea = currentFloorRooms.reduce((sum, room) => {
+      const width = Math.round(room.width / plan.scale);
+      const height = Math.round(room.height / plan.scale);
+      return sum + width * height;
+    }, 0);
+
+    return {
+      plot: `${plan.plot.width} x ${plan.plot.length} ft`,
+      floors: plan.floors,
+      rooms: plan.rooms.length,
+      layers: plan.layers?.length || 0,
+      floorArea: currentFloorArea
+    };
+  }, [plan, activeFloor]);
+
+  const selectedLabel = useMemo(() => resolveSelectedLabel(plan, selected), [plan, selected]);
+
+  function restoreAutosave() {
+    try {
+      const raw = localStorage.getItem(AUTOSAVE_KEY);
+      if (!raw) return;
+
+      const data = JSON.parse(raw);
+      if (!data?.plan) return;
+
+      const ok = window.confirm(
+        "NexaCAD found an autosaved project. Do you want to restore it?"
+      );
+
+      if (!ok) return;
+
+      setPlan(normalizePlan(data.plan));
+      setActiveFloor(data.activeFloor || 0);
+      setViewMode(data.viewMode === "dashboard" ? "2d" : data.viewMode || "2d");
+      setAutosaveStatus("Autosave restored");
+    } catch {
+      setAutosaveStatus("Autosave restore failed");
+    }
+  }
+
+  function clearAutosave() {
+    localStorage.removeItem(AUTOSAVE_KEY);
+    setAutosaveStatus("Autosave cleared");
+    alert("Autosave cleared.");
+  }
+
+  async function checkBackend() {
+    try {
+      const res = await axios.get(`${API_URL}/api/health`);
+      setBackendStatus(res.data.ok ? "online" : "offline");
+    } catch {
+      setBackendStatus("offline");
+    }
+  }
+
+  async function loadProjects() {
+    try {
+      const res = await axios.get(`${API_URL}/api/projects`);
+      setProjects((res.data.projects || []).map(normalizePlan));
+    } catch {
+      setProjects([]);
+    }
+  }
+
+  function commit(nextPlan) {
+    const finalPlan = normalizePlan(nextPlan);
+
+    if (plan) {
+      setHistory((items) => [...items, clone(plan)].slice(-40));
+    }
+
+    setFuture([]);
+    setPlan(finalPlan);
+  }
+
+  async function generatePlan() {
+    if (!prompt.trim()) {
+      alert("Please enter house/building requirements.");
+      return;
+    }
+
+    setLoading(true);
+    setSelected(null);
+    setHistory([]);
+    setFuture([]);
+
+    try {
+      const res = await axios.post(`${API_URL}/api/ai/generate-plan`, { prompt });
+
+      if (res.data.ok) {
+        setPlan(normalizePlan(res.data.plan));
+        setActiveFloor(0);
+        setViewMode("2d");
+        setZoom(1);
+        setStagePosition({ x: 0, y: 0 });
+      }
+    } catch {
+      alert("Backend is not reachable. Start NexaCAD backend on port 5100.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function applyAIEdit() {
+    if (!plan) {
+      alert("Generate or start a plan first.");
+      return;
+    }
+
+    if (!aiCommand.trim()) {
+      alert("Enter an AI edit command.");
+      return;
+    }
+
+    setCommandLoading(true);
+
+    try {
+      const res = await axios.post(`${API_URL}/api/ai/edit-plan`, {
+        plan,
+        command: aiCommand
+      });
+
+      if (res.data.ok) {
+        commit(res.data.plan);
+        setAiCommand("");
+        setViewMode("2d");
+      }
+    } catch {
+      alert("AI edit failed. Check backend.");
+    } finally {
+      setCommandLoading(false);
+    }
+  }
+
+  async function saveProject() {
+    if (!plan) {
+      alert("Generate or start a project first.");
+      return;
+    }
+
+    if (collisionWarnings.length > 0) {
+      const ok = window.confirm(
+        `This project has ${collisionWarnings.length} room overlap warning(s). Save anyway?`
+      );
+      if (!ok) return;
+    }
+
+    setSaving(true);
+
+    try {
+      const res = await axios.post(`${API_URL}/api/projects`, {
+        project: normalizePlan(plan)
+      });
+
+      if (res.data.ok) {
+        setPlan(normalizePlan(res.data.project));
+        await loadProjects();
+        alert("Project saved.");
+      }
+    } catch {
+      alert("Project could not be saved.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteProject(id) {
+    const ok = window.confirm("Delete this project?");
+    if (!ok) return;
+
+    try {
+      await axios.delete(`${API_URL}/api/projects/${id}`);
+      await loadProjects();
+
+      if (plan?.id === id) {
+        setPlan(null);
+        setViewMode("dashboard");
+      }
+    } catch {
+      alert("Could not delete project.");
+    }
+  }
+
+  function loadProject(project) {
+    setPlan(normalizePlan(project));
+    setSelected(null);
+    setActiveFloor(0);
+    setViewMode("2d");
+    setHistory([]);
+    setFuture([]);
+    setZoom(1);
+    setStagePosition({ x: 0, y: 0 });
+  }
+
+  function createStarter(template) {
+    const starter = createStarterPlan(template);
+    setPlan(starter);
+    setPrompt(`Starter generated: ${template.title}`);
+    setSelected(null);
+    setActiveFloor(0);
+    setViewMode("2d");
+    setHistory([]);
+    setFuture([]);
+    setZoom(1);
+    setStagePosition({ x: 0, y: 0 });
+  }
+
+  function undo() {
+    if (history.length === 0 || !plan) return;
+
+    const previous = history[history.length - 1];
+    setHistory((items) => items.slice(0, -1));
+    setFuture((items) => [clone(plan), ...items].slice(0, 40));
+    setPlan(normalizePlan(previous));
+  }
+
+  function redo() {
+    if (future.length === 0 || !plan) return;
+
+    const next = future[0];
+    setFuture((items) => items.slice(1));
+    setHistory((items) => [...items, clone(plan)].slice(-40));
+    setPlan(normalizePlan(next));
+  }
+
+  function updatePlanList(listName, id, updates) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+    next[listName] = next[listName].map((item) =>
+      item.id === id ? { ...item, ...updates } : item
+    );
+
+    commit(next);
+  }
+
+  function updateWallEndpoint(id, endpoint, position) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+
+    next.walls = next.walls.map((wall) => {
+      if (wall.id !== id) return wall;
+
+      const start = {
+        x: wall.x,
+        y: wall.y
+      };
+
+      const end = {
+        x: wall.x + wall.width,
+        y: wall.y + wall.height
+      };
+
+      if (endpoint === "start") {
+        return {
+          ...wall,
+          x: position.x,
+          y: position.y,
+          width: end.x - position.x,
+          height: end.y - position.y
+        };
+      }
+
+      return {
+        ...wall,
+        width: position.x - start.x,
+        height: position.y - start.y
+      };
+    });
+
+    commit(next);
+  }
+
+  function updateSelectedEntity(updates) {
+    if (!plan || !selected) return;
+
+    const listName =
+      selected.type === "room"
+        ? "rooms"
+        : selected.type === "door"
+        ? "doors"
+        : selected.type === "window"
+        ? "windows"
+        : selected.type === "stairs"
+        ? "stairs"
+        : selected.type === "wall"
+        ? "walls"
+        : selected.type === "dimension"
+        ? "dimensions"
+        : selected.type === "text"
+        ? "texts"
+        : null;
+
+    if (!listName) return;
+    updatePlanList(listName, selected.id, updates);
+  }
+
+  function updateProjectInfo(projectInfo) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+    next.projectInfo = {
+      ...getDefaultProjectInfo(next),
+      ...projectInfo
+    };
+
+    commit(next);
+  }
+
+  function toggleLayer(layerId) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+    next.layers = next.layers.map((layer) =>
+      layer.id === layerId ? { ...layer, visible: !layer.visible } : layer
+    );
+
+    commit(next);
+  }
+
+  function autoFixOverlaps() {
+    if (!plan) {
+      alert("Start or generate a project first.");
+      return;
+    }
+
+    const next = normalizePlan(clone(plan));
+    const scale = next.scale || 12;
+    const gap = 2 * scale;
+    const maxWidth = next.canvas?.width || next.plot.width * scale || 720;
+
+    for (let floor = 0; floor < next.floors; floor += 1) {
+      const rooms = next.rooms
+        .filter((room) => room.floor === floor && room.type !== "terrace")
+        .sort((a, b) => a.y - b.y || a.x - b.x);
+
+      let cursorX = gap;
+      let cursorY = gap;
+      let rowHeight = 0;
+
+      rooms.forEach((room) => {
+        if (cursorX + room.width > maxWidth - gap) {
+          cursorX = gap;
+          cursorY += rowHeight + gap;
+          rowHeight = 0;
+        }
+
+        room.x = cursorX;
+        room.y = cursorY;
+
+        cursorX += room.width + gap;
+        rowHeight = Math.max(rowHeight, room.height);
+      });
+    }
+
+    next.doors = next.doors.map((door) => {
+      const room = next.rooms.find((item) => item.id === door.roomId);
+      if (!room) return door;
+
+      return {
+        ...door,
+        x: room.x + room.width / 2 - door.width / 2,
+        y: room.y + room.height - door.height
+      };
+    });
+
+    next.windows = next.windows.map((windowItem) => {
+      const room = next.rooms.find((item) => item.id === windowItem.roomId);
+      if (!room) return windowItem;
+
+      return {
+        ...windowItem,
+        x: room.x + room.width - windowItem.width,
+        y: room.y + room.height / 2 - windowItem.height / 2
+      };
+    });
+
+    commit(next);
+    setSelected(null);
+    alert("Overlap auto-fix applied.");
+  }
+
+  function addRoom(position = { x: 48, y: 48 }) {
+    if (!plan) return;
+
+    const scale = plan.scale || 12;
+    const next = normalizePlan(clone(plan));
+
+    const item = {
+      id: uuidv4(),
+      name: "New Room",
+      type: "room",
+      floor: activeFloor,
+      x: position.x,
+      y: position.y,
+      width: 12 * scale,
+      height: 12 * scale,
+      color: "#e0e7ff",
+      wallThickness: 6,
+      layer: "architecture",
+      locked: false
+    };
+
+    next.rooms.push(item);
+    commit(next);
+    setSelected({ type: "room", id: item.id });
+  }
+
+  function addCurvedWall(position = { x: 120, y: 120 }) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+
+    const item = {
+      id: uuidv4(),
+      floor: activeFloor,
+      x: position.x,
+      y: position.y,
+      radius: 72,
+      startAngle: 205,
+      endAngle: 335,
+      thickness: 8,
+      height: 2.1,
+      type: "curved-wall",
+      name: "Curved Gallery Wall",
+      layer: "curves"
+    };
+
+    next.curvedWalls.push(item);
+    commit(next);
+    setSelected({ type: "curvedWall", id: item.id });
+  }
+
+  function addWall(position = { x: 60, y: 60 }) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+
+    const item = {
+      id: uuidv4(),
+      floor: activeFloor,
+      x: position.x,
+      y: position.y,
+      width: 120,
+      height: 0,
+      thickness: 8,
+      type: "wall",
+      layer: "walls"
+    };
+
+    next.walls.push(item);
+    commit(next);
+    setSelected({ type: "wall", id: item.id });
+  }
+
+  function addLineObject(kind, payload) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+
+    if (kind === "wall") {
+      const item = {
+        id: uuidv4(),
+        floor: activeFloor,
+        x: payload.x,
+        y: payload.y,
+        width: payload.width,
+        height: payload.height,
+        thickness: 8,
+        type: "wall",
+        layer: "walls"
+      };
+
+      next.walls.push(item);
+      commit(next);
+      setSelected({ type: "wall", id: item.id });
+      return;
+    }
+
+    if (kind === "dimension") {
+      const feet =
+        payload.label ||
+        `${calculateDistanceFeet(payload.width, payload.height || 0, plan.scale || 12)} ft`;
+
+      const item = {
+        id: uuidv4(),
+        floor: activeFloor,
+        x: payload.x,
+        y: payload.y,
+        width: payload.width,
+        height: payload.height || 0,
+        label: feet,
+        layer: "dimensions"
+      };
+
+      next.dimensions.push(item);
+      commit(next);
+      setSelected({ type: "dimension", id: item.id });
+    }
+  }
+
+  function findSelectedRoomOrFirstRoom(next) {
+    if (selected?.type === "room") {
+      const selectedRoom = next.rooms.find((item) => item.id === selected.id);
+      if (selectedRoom) return selectedRoom;
+    }
+
+    return next.rooms.find((item) => item.floor === activeFloor) || null;
+  }
+
+  function addDoor(position = null) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+    const room = findSelectedRoomOrFirstRoom(next);
+
+    const fallbackPoint = {
+      x: room ? room.x + room.width / 2 - 18 : 80,
+      y: room ? room.y + room.height - 8 : 80
+    };
+
+    const nearest = position ? findNearestWall(next, position, activeFloor) : null;
+    const geometry = makeSnappedOpeningGeometry(
+      "door",
+      nearest,
+      position || fallbackPoint
+    );
+
+    const item = {
+      id: uuidv4(),
+      roomId: room?.id || null,
+      floor: activeFloor,
+      x: geometry.x,
+      y: geometry.y,
+      width: geometry.width,
+      height: geometry.height,
+      type: "door",
+      label: nearest ? "Door - Snapped to Wall" : "Door",
+      layer: "openings"
+    };
+
+    next.doors.push(item);
+    commit(next);
+    setSelected({ type: "door", id: item.id });
+  }
+
+  function addWindow(position = null) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+    const room = findSelectedRoomOrFirstRoom(next);
+
+    const fallbackPoint = {
+      x: room ? room.x + room.width - 8 : 90,
+      y: room ? room.y + room.height / 2 - 20 : 90
+    };
+
+    const nearest = position ? findNearestWall(next, position, activeFloor) : null;
+    const geometry = makeSnappedOpeningGeometry(
+      "window",
+      nearest,
+      position || fallbackPoint
+    );
+
+    const item = {
+      id: uuidv4(),
+      roomId: room?.id || null,
+      floor: activeFloor,
+      x: geometry.x,
+      y: geometry.y,
+      width: geometry.width,
+      height: geometry.height,
+      type: "window",
+      label: nearest ? "Window - Snapped to Wall" : "Window",
+      layer: "openings"
+    };
+
+    next.windows.push(item);
+    commit(next);
+    setSelected({ type: "window", id: item.id });
+  }
+
+  function addStairs(position = { x: 80, y: 80 }) {
+    if (!plan) return;
+
+    const scale = plan.scale || 12;
+    const next = normalizePlan(clone(plan));
+
+    const item = {
+      id: uuidv4(),
+      floor: activeFloor,
+      x: position.x,
+      y: position.y,
+      width: 10 * scale,
+      height: 14 * scale,
+      type: "straight-stair",
+      name: "Stairs",
+      layer: "stairs"
+    };
+
+    next.stairs.push(item);
+    commit(next);
+    setSelected({ type: "stairs", id: item.id });
+  }
+
+  function addDimension(position = { x: 80, y: 80 }) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+
+    const item = {
+      id: uuidv4(),
+      floor: activeFloor,
+      x: position.x,
+      y: position.y,
+      width: 120,
+      height: 0,
+      label: `${Math.round(120 / (plan.scale || 12))} ft`,
+      layer: "dimensions"
+    };
+
+    next.dimensions.push(item);
+    commit(next);
+    setSelected({ type: "dimension", id: item.id });
+  }
+
+  function addText(position = { x: 80, y: 80 }) {
+    if (!plan) return;
+
+    const next = normalizePlan(clone(plan));
+
+    const item = {
+      id: uuidv4(),
+      floor: activeFloor,
+      x: position.x,
+      y: position.y,
+      text: "New Label",
+      fontSize: 16,
+      fontStyle: "bold",
+      color: "#0f172a",
+      layer: "text"
+    };
+
+    next.texts.push(item);
+    commit(next);
+    setSelected({ type: "text", id: item.id });
+  }
+
+  function onCanvasCommand(position) {
+    if (activeTool === "room") addRoom(position);
+    if (activeTool === "wall") addWall(position);
+    if (activeTool === "door") addDoor(position);
+    if (activeTool === "window") addWindow(position);
+    if (activeTool === "stairs") addStairs(position);
+    if (activeTool === "dimension") addDimension(position);
+    if (activeTool === "text") addText(position);
+  }
+
+  function deleteSelected() {
+    if (!plan || !selected) return;
+
+    const next = normalizePlan(clone(plan));
+
+    if (selected.type === "room") {
+      next.rooms = next.rooms.filter((item) => item.id !== selected.id);
+      next.doors = next.doors.filter((item) => item.roomId !== selected.id);
+      next.windows = next.windows.filter((item) => item.roomId !== selected.id);
+    }
+
+    if (selected.type === "door") next.doors = next.doors.filter((item) => item.id !== selected.id);
+    if (selected.type === "window") next.windows = next.windows.filter((item) => item.id !== selected.id);
+    if (selected.type === "stairs") next.stairs = next.stairs.filter((item) => item.id !== selected.id);
+    if (selected.type === "wall") next.walls = next.walls.filter((item) => item.id !== selected.id);
+    if (selected.type === "furniture") next.furniture = next.furniture.filter((item) => item.id !== selected.id);
+    if (selected.type === "curvedWall") next.curvedWalls = next.curvedWalls.filter((item) => item.id !== selected.id);
+    if (selected.type === "dimension") next.dimensions = next.dimensions.filter((item) => item.id !== selected.id);
+    if (selected.type === "text") next.texts = next.texts.filter((item) => item.id !== selected.id);
+
+    commit(next);
+    setSelected(null);
+  }
+
+  function duplicateSelected() {
+    if (!plan || !selected) return;
+
+    const next = normalizePlan(clone(plan));
+
+    const listName =
+      selected.type === "room"
+        ? "rooms"
+        : selected.type === "door"
+        ? "doors"
+        : selected.type === "window"
+        ? "windows"
+        : selected.type === "stairs"
+        ? "stairs"
+        : selected.type === "wall"
+        ? "walls"
+        : selected.type === "dimension"
+        ? "dimensions"
+        : selected.type === "text"
+        ? "texts"
+        : null;
+
+    if (!listName) return;
+
+    const original = next[listName].find((item) => item.id === selected.id);
+    if (!original) return;
+
+    const copy = {
+      ...clone(original),
+      id: uuidv4(),
+      x: original.x + 24,
+      y: original.y + 24,
+      name: original.name ? `${original.name} Copy` : original.name,
+      text: original.text ? `${original.text} Copy` : original.text
+    };
+
+    next[listName].push(copy);
+    commit(next);
+    setSelected({ type: selected.type, id: copy.id });
+  }
+
+  function exportProjectJSON() {
+    if (!plan) {
+      alert("Generate or load a project first.");
+      return;
+    }
+
+    const payload = {
+      app: "NexaCAD AI Pro",
+      version: "phase-12",
+      exportedAt: new Date().toISOString(),
+      project: normalizePlan(plan)
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json"
+    });
+
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${plan.title || "nexacad-project"}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+  }
+
+  function importProjectJSON(file) {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result || "{}"));
+        const importedProject = parsed.project || parsed;
+
+        if (!importedProject || !Array.isArray(importedProject.rooms)) {
+          alert("Invalid NexaCAD project JSON.");
+          return;
+        }
+
+        const normalized = normalizePlan({
+          ...importedProject,
+          id: importedProject.id || uuidv4(),
+          title: importedProject.title || "Imported NexaCAD Project"
+        });
+
+        setPlan(normalized);
+        setActiveFloor(0);
+        setViewMode("2d");
+        setSelected(null);
+        setHistory([]);
+        setFuture([]);
+        setZoom(1);
+        setStagePosition({ x: 0, y: 0 });
+
+        alert("Project imported successfully.");
+      } catch {
+        alert("Could not import JSON file.");
+      }
+    };
+
+    reader.readAsText(file);
+  }
+
+  const shellClass = fullscreenStudio ? "app-shell studio-fullscreen" : "app-shell";
+
+  return (
+    <div className={shellClass}>
+      <header className="main-header">
+        <div className="brand">
+          <div className="brand-logo">
+            <Building2 size={30} />
+          </div>
+
+          <div>
+            <h1>NexaCAD AI Pro</h1>
+            <p>AI Architect Studio + CAD Editor + 3D Preview</p>
+          </div>
+        </div>
+
+        <div className="top-actions">
+          <button
+            className="studio-mode-btn"
+            onClick={() => setViewMode("dashboard")}
+            title="Dashboard"
+          >
+            <LayoutDashboard size={17} />
+            Dashboard
+          </button>
+
+          <button
+            className="studio-mode-btn"
+            onClick={() => setFullscreenStudio((value) => !value)}
+            title="Fullscreen Studio"
+          >
+            {fullscreenStudio ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
+            {fullscreenStudio ? "Exit Fullscreen" : "Fullscreen"}
+          </button>
+
+          <div className="status-pill">
+            {backendStatus === "online" ? <Wifi size={16} /> : <WifiOff size={16} />}
+            <span>
+              Backend{" "}
+              {backendStatus === "checking"
+                ? "Checking"
+                : backendStatus === "online"
+                ? "Online"
+                : "Offline"}
+            </span>
+
+            <button onClick={checkBackend}>
+              <RefreshCw size={14} />
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div className="main-layout">
+        <aside className="left-panel">
+          <AICommandPanel
+            prompt={prompt}
+            setPrompt={setPrompt}
+            onGenerate={generatePlan}
+            aiCommand={aiCommand}
+            setAiCommand={setAiCommand}
+            onEditPlan={applyAIEdit}
+            loading={loading}
+            commandLoading={commandLoading}
+          />
+
+          <section className="template-panel">
+            <div className="panel-heading">
+              <Sparkles size={18} />
+              <span>Quick AI Templates</span>
+            </div>
+
+            <div className="template-grid">
+              {QUICK_TEMPLATES.map((template) => (
+                <button
+                  key={template.id}
+                  className="template-card"
+                  onClick={() => setPrompt(template.prompt)}
+                >
+                  <strong>{template.title}</strong>
+                  <span>{template.subtitle}</span>
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <ProjectSettingsPanel
+            plan={plan}
+            onUpdateProjectInfo={updateProjectInfo}
+          />
+
+          <ProjectBackupPanel
+            plan={plan}
+            collisionWarnings={collisionWarnings}
+            onExportJSON={exportProjectJSON}
+            onImportJSON={importProjectJSON}
+          />
+
+          <div className="autosave-card">
+            <div>
+              <strong>Autosave</strong>
+              <span>{autosaveStatus}</span>
+            </div>
+
+            <button onClick={clearAutosave}>
+              <RotateCcw size={15} />
+              Clear
+            </button>
+          </div>
+
+          <ProjectPanel
+            projects={projects}
+            onLoadProject={loadProject}
+            onDeleteProject={deleteProject}
+          />
+        </aside>
+
+        <CADToolbar
+          activeTool={activeTool}
+          setActiveTool={setActiveTool}
+          onDuplicate={duplicateSelected}
+          onDelete={deleteSelected}
+          onUndo={undo}
+          onRedo={redo}
+          onZoomIn={() => setZoom((value) => Math.min(2.2, value + 0.1))}
+          onZoomOut={() => setZoom((value) => Math.max(0.45, value - 0.1))}
+          onSave={saveProject}
+          onPNG={() => exportStagePNG(stageRef, plan)}
+          onPDF={() => exportPlanPDF(stageRef, plan, activeFloor)}
+          onDXF={() => exportPlanDXF(plan)}
+          canEdit={Boolean(selected)}
+        />
+
+        <main className="workspace">
+          {viewMode === "dashboard" ? (
+            <section className="dashboard-screen">
+              <div className="dashboard-hero">
+                <div>
+                  <span className="dashboard-badge">NexaCAD AI Pro Phase 12</span>
+                  <h2>AI Architecture Studio</h2>
+                  <p>
+                    Start from a professional template, generate a plan with AI, edit walls
+                    with endpoint handles, preview in 3D, export PDF/PNG/DXF and BOQ.
+                  </p>
+
+                  <div className="dashboard-actions">
+                    <button onClick={() => setViewMode("2d")}>
+                      <DraftingCompass size={18} />
+                      Open Studio
+                    </button>
+
+                    <button onClick={() => setFullscreenStudio(true)}>
+                      <Maximize2 size={18} />
+                      Fullscreen Studio
+                    </button>
+                  </div>
+                </div>
+
+                <div className="dashboard-orb">
+                  <Building2 size={58} />
+                  <span>AI CAD</span>
+                </div>
+              </div>
+
+              <div className="starter-grid">
+                {STARTER_TEMPLATES.map((template) => (
+                  <button
+                    key={template.id}
+                    className="starter-card"
+                    onClick={() => createStarter(template)}
+                  >
+                    <strong>{template.title}</strong>
+                    <span>{template.subtitle}</span>
+                    <small>
+                      {template.width} x {template.length} ft • {template.floors} floors
+                    </small>
+                  </button>
+                ))}
+              </div>
+
+              <div className="dashboard-status-grid">
+                <div>
+                  <span>Current Project</span>
+                  <strong>{plan?.title || "No project loaded"}</strong>
+                </div>
+
+                <div>
+                  <span>Backend</span>
+                  <strong>{backendStatus}</strong>
+                </div>
+
+                <div>
+                  <span>Safety</span>
+                  <strong>
+                    {collisionWarnings.length > 0
+                      ? `${collisionWarnings.length} overlap warning(s)`
+                      : "No warnings"}
+                  </strong>
+                </div>
+              </div>
+            </section>
+          ) : (
+            <>
+              <section className="workspace-hero">
+                <div className="workspace-hero-main">
+                  <small>ACTIVE PROJECT</small>
+                  <h2>{plan?.title || "Start a new AI architectural project"}</h2>
+                  <p>
+                    {plan
+                      ? `${stats.plot} • ${stats.floors} floor(s) • ${stats.rooms} room objects`
+                      : "Use AI prompt, starter dashboard, or a quick template to generate a plan."}
+                  </p>
+                </div>
+
+                <div className="workspace-hero-grid">
+                  <div className="hero-mini-card">
+                    <span>Selection</span>
+                    <strong>{selectedLabel}</strong>
+                  </div>
+
+                  <div className="hero-mini-card">
+                    <span>Current Floor Area</span>
+                    <strong>{stats.floorArea} sq ft</strong>
+                  </div>
+
+                  <div className="hero-mini-card">
+                    <span>Layers</span>
+                    <strong>{stats.layers}</strong>
+                  </div>
+
+                  <div
+                    className={
+                      collisionWarnings.length > 0
+                        ? "hero-mini-card warning"
+                        : "hero-mini-card"
+                    }
+                  >
+                    <span>Safety</span>
+                    <strong>
+                      {collisionWarnings.length > 0
+                        ? `${collisionWarnings.length} warning(s)`
+                        : "No overlaps"}
+                    </strong>
+                  </div>
+                </div>
+              </section>
+
+              <section className="stats-row">
+                <div>
+                  <Ruler size={20} />
+                  <span>Plot</span>
+                  <strong>{stats.plot}</strong>
+                </div>
+
+                <div>
+                  <Home size={20} />
+                  <span>Floors</span>
+                  <strong>{stats.floors}</strong>
+                </div>
+
+                <div>
+                  <Boxes size={20} />
+                  <span>Rooms</span>
+                  <strong>{stats.rooms}</strong>
+                </div>
+
+                <div>
+                  <Layers size={20} />
+                  <span>Floor Area</span>
+                  <strong>{stats.floorArea || "-"} sq ft</strong>
+                </div>
+              </section>
+
+              <section className="floor-tabs">
+                {plan ? (
+                  Array.from({ length: plan.floors }).map((_, index) => (
+                    <button
+                      key={index}
+                      className={activeFloor === index ? "active" : ""}
+                      onClick={() => {
+                        setActiveFloor(index);
+                        setSelected(null);
+                      }}
+                    >
+                      {index === 0 ? "Ground Floor" : `Floor ${index}`}
+                    </button>
+                  ))
+                ) : (
+                  <button className="active">No Floor</button>
+                )}
+
+                <button
+                  className={viewMode === "2d" ? "active view-toggle" : "view-toggle"}
+                  onClick={() => setViewMode("2d")}
+                >
+                  <DraftingCompass size={15} />
+                  2D CAD
+                </button>
+
+                <button
+                  className={viewMode === "3d" ? "active view-toggle" : "view-toggle"}
+                  onClick={() => setViewMode("3d")}
+                >
+                  <Box size={15} />
+                  3D Preview
+                </button>
+
+                <button
+                  className="view-toggle auto-fix-btn"
+                  onClick={autoFixOverlaps}
+                  disabled={!plan}
+                >
+                  <Wand2 size={15} />
+                  Auto-Fix Overlaps
+                </button>
+
+                <button
+                  className="view-toggle export-csv"
+                  onClick={() => exportBOQCSV(plan)}
+                  disabled={!plan}
+                >
+                  <FileSpreadsheet size={15} />
+                  BOQ CSV
+                </button>
+
+                <span className="zoom-label">Zoom: {Math.round(zoom * 100)}%</span>
+                <span className="zoom-label">
+                  Tool: <strong>{activeTool}</strong>
+                </span>
+                <span className="saving-label">{saving ? "Saving..." : ""}</span>
+
+                {collisionWarnings.length > 0 && (
+                  <span className="warning-chip">
+                    <AlertTriangle size={14} />
+                    {collisionWarnings.length} overlap warning(s)
+                  </span>
+                )}
+              </section>
+
+              {viewMode === "2d" ? (
+                <CADCanvas
+                  plan={plan}
+                  activeFloor={activeFloor}
+                  activeTool={activeTool}
+                  selected={selected}
+                  setSelected={setSelected}
+                  stageRef={stageRef}
+                  zoom={zoom}
+                  stagePosition={stagePosition}
+                  setStagePosition={setStagePosition}
+                  onMoveRoom={(id, updates) => updatePlanList("rooms", id, updates)}
+                  onResizeRoom={(id, updates) => updatePlanList("rooms", id, updates)}
+                  onMoveDoor={(id, updates) => updatePlanList("doors", id, updates)}
+                  onMoveWindow={(id, updates) => updatePlanList("windows", id, updates)}
+                  onMoveStair={(id, updates) => updatePlanList("stairs", id, updates)}
+                  onMoveWall={(id, updates) => updatePlanList("walls", id, updates)}
+                  onResizeWallEndpoint={updateWallEndpoint}
+                  onMoveDimension={(id, updates) =>
+                    updatePlanList("dimensions", id, updates)
+                  }
+                  onMoveText={(id, updates) => updatePlanList("texts", id, updates)}
+                  onCanvasCommand={onCanvasCommand}
+                  onCreateLineObject={addLineObject}
+                />
+              ) : (
+                <ThreeDPreview plan={plan} activeFloor={activeFloor} />
+              )}
+            </>
+          )}
+        </main>
+
+        <div className="right-stack">
+          <InspectorPanel
+            plan={plan}
+            selected={selected}
+            updateSelectedEntity={updateSelectedEntity}
+            toggleLayer={toggleLayer}
+          />
+
+          <RoomSchedulePanel
+            plan={plan}
+            activeFloor={activeFloor}
+            selected={selected}
+            setSelected={setSelected}
+            setActiveFloor={setActiveFloor}
+          />
+
+          <EstimatePanel plan={plan} />
+        </div>
+      </div>
+    </div>
+  );
+}
