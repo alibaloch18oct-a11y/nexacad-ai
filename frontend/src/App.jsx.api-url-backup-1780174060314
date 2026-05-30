@@ -35,9 +35,6 @@ import RoomSchedulePanel from "./components/RoomSchedulePanel.jsx";
 import ProjectBackupPanel from "./components/ProjectBackupPanel.jsx";
 import { downloadClientProposalPdf } from "./utils/proposalPdf.js";
 
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:5100";
-
-
 import {
   exportBOQCSV,
   exportPlanDXF,
@@ -45,7 +42,7 @@ import {
   exportStagePNG
 } from "./utils/exportUtils.js";
 
-const API_URL = import.meta.env.VITE_API_URL || `${API_BASE}`;
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5100";
 const AUTOSAVE_KEY = "nexacad_ai_pro_autosave_v1";
 
 const SAMPLE_PROMPT =
