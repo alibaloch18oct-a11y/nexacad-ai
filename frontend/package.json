@@ -4,7 +4,7 @@
   "description": "NexaCAD AI Pro frontend - AI CAD and architecture studio",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0 --port 5173",
+    "dev": "vite",
     "build": "vite build",
     "preview": "vite preview"
   },
